@@ -79,6 +79,10 @@ use gtk::{
 };
 
 const APP_ID: &'static str = "com.github.epilys.rlr";
+/// Radius of the protractor's center handle, the only part that catches clicks in click-through
+/// mode.
+const HANDLE_RADIUS: f64 = 14.;
+const DOUBLE_CLICK_MS: u32 = 400;
 
 trait CairoContextExt {
     fn set_primary_color(&self, settings: &Settings);
@@ -456,6 +460,8 @@ struct Rlr {
     precision: bool,
     edit_angle_offset: bool,
     angle_offset: f64,
+    click_through: bool,
+    last_handle_press: u32,
     interval: Interval,
     ppi: f64,
     scale_factor: i32,
@@ -483,6 +489,8 @@ impl Default for Rlr {
             precision: true,
             edit_angle_offset: false,
             angle_offset: 0.,
+            click_through: false,
+            last_handle_press: 0,
             interval: Interval::None,
             ppi: 72.,
             scale_factor: 1,
@@ -510,6 +518,37 @@ impl Rlr {
         } else {
             window.resize(self.width, self.height);
         }
+    }
+
+    /// Restricts the area that catches pointer input: the whole window as a ruler, the disk as a
+    /// protractor, and only the center handle in click-through mode. Clicks anywhere else go to
+    /// the window underneath.
+    fn update_input_shape(&self, window: &gtk::ApplicationWindow) {
+        if !self.protractor {
+            window.input_shape_combine_region(None);
+            return;
+        }
+        let length = f64::from(std::cmp::min(self.width, self.height));
+        let center = length / 2.;
+        let radius = if self.click_through {
+            HANDLE_RADIUS
+        } else {
+            center
+        };
+        let region = gtk::cairo::Region::create();
+        let top = (center - radius).floor().max(0.) as i32;
+        let bottom = (center + radius).ceil().min(length) as i32;
+        for y in top..bottom {
+            let dy = (f64::from(y) + 0.5 - center).abs();
+            if dy > radius {
+                continue;
+            }
+            let half = (radius * radius - dy * dy).sqrt();
+            let x0 = (center - half).floor() as i32;
+            let x1 = (center + half).ceil() as i32;
+            let _ = region.union_rectangle(&gtk::cairo::RectangleInt::new(x0, y, x1 - x0, 1));
+        }
+        window.input_shape_combine_region(Some(&region));
     }
 
     fn calc_angle_of_point(&self, (xr, yr): (f64, f64)) -> f64 {
@@ -656,6 +695,17 @@ impl Rlr {
             measured.to_degrees()
         ))
         .expect("Invalid cairo surface state");
+
+        if self.click_through {
+            cr.save().unwrap();
+            cr.arc(length / 2., length / 2., HANDLE_RADIUS, 0., 2. * PI);
+            cr.set_source_rgba(0.5, 0.5, 0.5, 0.35);
+            cr.fill_preserve().expect("Invalid cairo surface state");
+            cr.set_primary_color(&self.settings);
+            cr.set_line_width(2.);
+            cr.stroke().expect("Invalid cairo surface state");
+            cr.restore().unwrap();
+        }
 
         glib::Propagation::Proceed
     }
@@ -954,6 +1004,7 @@ fn run_app() -> Option<i32> {
         application.set_accels_for_action("app.flip", &["<Shift>R"]);
         application.set_accels_for_action("app.protractor", &["P"]);
         application.set_accels_for_action("app.freeze", &["F", "space"]);
+        application.set_accels_for_action("app.click_through", &["T"]);
         application.set_accels_for_action("app.increase", &["plus"]);
         application.set_accels_for_action("app.decrease", &["minus"]);
         application.set_accels_for_action("app.increase_font_size", &["<Primary>plus"]);
@@ -990,6 +1041,11 @@ fn run_app() -> Option<i32> {
 
 fn main() {
     gio::resources_register_include!("compiled.gresource").unwrap();
+    // GNOME on Wayland ignores a client's keep-above request but honors it for X11 clients,
+    // which click-through mode relies on. GDK_BACKEND still overrides this.
+    if std::env::var_os("GDK_BACKEND").is_none() {
+        gdk::set_allowed_backends("x11,*");
+    }
 
     if let Some(exit_code) = run_app() {
         std::process::exit(exit_code);
@@ -1077,6 +1133,26 @@ where
     window.connect_button_press_event(glib::clone!(@strong rlr, @strong menu =>
     move |window: &gtk::ApplicationWindow, ev: &gtk::gdk::EventButton| {
         let mut lck = rlr.lock().unwrap();
+
+        if lck.protractor
+            && lck.click_through
+            && ev.button() == 1
+            && matches!(ev.event_type(), gtk::gdk::EventType::ButtonPress)
+        {
+            let time = ev.time();
+            if lck.last_handle_press != 0
+                && time.wrapping_sub(lck.last_handle_press) <= DOUBLE_CLICK_MS
+            {
+                lck.click_through = false;
+                lck.last_handle_press = 0;
+                lck.update_input_shape(window);
+                window.set_keep_above(false);
+                drop(lck);
+                window.queue_draw();
+                return glib::Propagation::Stop;
+            }
+            lck.last_handle_press = time;
+        }
 
         if matches!(ev.event_type(), gtk::gdk::EventType::ButtonPress)
             && lck.interval.is_start()
@@ -1178,6 +1254,7 @@ where
                 let mut lck = rlr.lock().unwrap();
                 lck.width = event.size().0.try_into().unwrap_or(i32::MAX);
                 lck.height = event.size().1.try_into().unwrap_or(i32::MAX);
+                lck.update_input_shape(window);
             }
             window.queue_draw();
 
@@ -1356,7 +1433,20 @@ fn add_actions(
                 lck.p_dimens = Some((lck.width,lck.height ));
                 lck.set_size(&window);
             }
+            lck.update_input_shape(&window);
 
+        }
+        window.queue_draw();
+    }));
+
+    let click_through = gio::SimpleAction::new("click_through", None);
+    click_through.connect_activate(glib::clone!(@strong rlr, @weak window => move |_, _| {
+        {
+            let mut lck = rlr.lock().unwrap();
+            lck.click_through = !lck.click_through;
+            lck.last_handle_press = 0;
+            lck.update_input_shape(&window);
+            window.set_keep_above(lck.click_through);
         }
         window.queue_draw();
     }));
@@ -1501,6 +1591,7 @@ fn add_actions(
     application.add_action(&decrease_font_size);
     application.add_action(&freeze);
     application.add_action(&protractor);
+    application.add_action(&click_through);
     application.add_action(&rotate);
     application.add_action(&flip);
     application.add_action(&about);
@@ -1846,6 +1937,8 @@ Press {ms}s{me} or {ms}F2{me} to {bs}open the Settings window{be}.
 Press {ms}r{me} to {bs}rotate{be} 90 degrees. Press {ms}{lt}Shift{gt}r{me} to {bs}flip \
              (mirror){be} the marks without rotation.
 Press {ms}p{me} to toggle {bs}protractor mode{be}.
+Press {ms}t{me} to toggle {bs}click-through{be} in protractor mode: clicks pass through the disk \
+             and only the center handle catches them. Double-click the handle to turn it off.
 Press {ms}f{me} or {ms}{lt}Space{gt}{me} to toggle {bs}freezing the measurements{be}.
 Press {ms}{primary}{me} and drag the angle base side to {bs}rotate it while in protractor mode{be}.
 Press {ms}{primary}{me} continuously to {bs}disable precision{be} (measurements will snap to \
@@ -1951,6 +2044,7 @@ fn make_context_menu(window: &gtk::ApplicationWindow, accel_group: &gtk::AccelGr
         ("Rotate", "app.rotate"),
         ("Flip", "app.flip"),
         ("Toggle protractor", "app.protractor"),
+        ("Toggle click-through", "app.click_through"),
         ("Toggle freeze", "app.freeze"),
         ("Increase size", "app.increase"),
         ("Decrease size", "app.decrease"),
