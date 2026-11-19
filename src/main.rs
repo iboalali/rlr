@@ -611,11 +611,15 @@ impl Rlr {
 
         // Draw radius tracking mouse position
         cr.save().unwrap();
-        let _angle = if self.precision {
-            angle + FRAC_PI_2
+        // Angle from the base line, counterclockwise, in [0, 2π). Without precision it snaps
+        // to whole degrees.
+        let measured = (angle - self.angle_offset).rem_euclid(2. * PI);
+        let measured = if self.precision {
+            measured
         } else {
-            angle.round() + FRAC_PI_2
+            measured.to_degrees().round().to_radians().rem_euclid(2. * PI)
         };
+        let _angle = self.angle_offset + measured + FRAC_PI_2;
         cr.move_to(length / 2. - 0.5, length / 2. - 0.5);
         cr.rotate(2. * PI - _angle);
         let cur = cr.current_point().unwrap();
@@ -635,11 +639,6 @@ impl Rlr {
 
         // Draw arc signifying which angle is being measured
         cr.move_to(length / 2. - 0.5, length / 2. - 0.5);
-        let angle = if root_position.1 < 0. {
-            (PI - angle.abs()) + PI - self.angle_offset
-        } else {
-            angle - self.angle_offset
-        };
         cr.arc(
             length / 2.,
             length / 2.,
@@ -653,8 +652,8 @@ impl Rlr {
         cr.move_to(length / 2. - 5.5, length / 2. - 15.5);
         cr.show_text(&format!(
             " {:.2}rad {:.2}°",
-            if self.precision { angle } else { angle.round() },
-            if self.precision { angle } else { angle.round() } * (180. / PI)
+            measured,
+            measured.to_degrees()
         ))
         .expect("Invalid cairo surface state");
 
