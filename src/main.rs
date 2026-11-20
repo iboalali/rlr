@@ -455,6 +455,7 @@ struct Rlr {
     height: i32,
     p_dimens: Option<(i32, i32)>,
     freeze: bool,
+    frozen_angle: Option<f64>,
     rotate: Rotation,
     protractor: bool,
     precision: bool,
@@ -484,6 +485,7 @@ impl Default for Rlr {
             height: 35,
             p_dimens: None,
             freeze: false,
+            frozen_angle: None,
             rotate: Rotation::E,
             protractor: false,
             precision: true,
@@ -563,15 +565,20 @@ impl Rlr {
         }
     }
 
+    /// Angle of the pointer around the protractor's center. It depends on the window size, so a
+    /// frozen protractor keeps the angle taken at freeze time instead of recomputing it.
+    fn pointer_angle(&self) -> f64 {
+        if let Some(angle) = self.frozen_angle {
+            return angle;
+        }
+        let length: f64 = f64::from(std::cmp::min(self.width, self.height));
+        let (x, y) = self.root_position;
+        self.calc_angle_of_point((f64::from(x) - length / 2., length / 2. - f64::from(y)))
+    }
+
     fn draw_douglas(&self, _drar: &DrawingArea, cr: &Context) -> glib::Propagation {
         let length: f64 = f64::from(std::cmp::min(self.width, self.height));
-        let root_position = self.root_position;
-        let root_position = (
-            f64::from(root_position.0) - length / 2.,
-            -1. * (f64::from(root_position.1) - length / 2.),
-        );
-        let (xr, yr) = root_position;
-        let angle = self.calc_angle_of_point((xr, yr));
+        let angle = self.pointer_angle();
         cr.arc(
             length / 2.,
             length / 2.,
@@ -1367,6 +1374,7 @@ fn add_actions(
         {
             let mut lck = rlr.lock().unwrap();
             lck.freeze = !lck.freeze;
+            lck.frozen_angle = (lck.freeze && lck.protractor).then(|| lck.pointer_angle());
         }
         window.queue_draw();
     }));
