@@ -524,11 +524,16 @@ impl Rlr {
         }
     }
 
-    /// Grows or shrinks the ruler along its length, or the protractor's diameter.
+    /// Grows or shrinks the ruler along its length, or the protractor's diameter. The protractor
+    /// keeps its center in place.
     fn resize_by(&mut self, delta: i32, window: &gtk::ApplicationWindow) {
         if self.protractor {
+            let old = self.width;
             self.width = std::cmp::max(MIN_SIZE, self.width + delta);
             self.height = self.width;
+            let shift = (self.width - old) / 2;
+            let (x, y) = window.position();
+            window.move_(x - shift, y - shift);
         } else if self.rotate.is_rotated() {
             self.height = std::cmp::max(MIN_SIZE, self.height + delta);
         } else {
