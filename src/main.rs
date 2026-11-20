@@ -116,65 +116,6 @@ const GSCHEMA_XML: &'static str =
 
 // include!("logo.xpm.rs");
 
-/// Encode rotation state/angles around the starting left side as the origin
-/// point.
-///
-/// ```text
-///                   North
-///                    ^^^
-///                    |3|
-///                    |2|
-///               >    |1|
-///              /     |0|      \
-///            -/      +-+       \
-///           /          .       v
-///       <--------+.........+-------->
-/// West  < 3 2 1 0|     .   |0 1 2 3 > East
-///       <--------+     .   +-------->
-///                      .        /
-///             ^      +++      /-
-///              \     |0|     <
-///               \    |1|
-///                    |2|
-///                    |3|
-///                    vvv
-///
-///                    South
-/// ```
-#[derive(Clone, Copy, Debug)]
-#[repr(u8)]
-enum Rotation {
-    E = 0,
-    S = 1,
-    W = 2,
-    N = 3,
-}
-
-impl Rotation {
-    #[inline(always)]
-    const fn is_rotated(self) -> bool {
-        !matches!(self as u8, 0 | 2)
-    }
-
-    #[inline(always)]
-    const fn is_reversed(self) -> bool {
-        matches!(self as u8, 2 | 3)
-    }
-
-    #[inline(always)]
-    fn next(&mut self) -> Option<(Option<bool>, Option<bool>)> {
-        use Rotation::*;
-        let (new_val, ret) = match *self {
-            E => (S, None),
-            S => (W, Some((false.into(), None))),
-            W => (N, Some((true.into(), false.into()))),
-            N => (E, Some((None, true.into()))),
-        };
-        *self = new_val;
-        ret
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 enum Interval {
     None,
@@ -455,10 +396,16 @@ struct Rlr {
     root_position: (i32, i32),
     width: i32,
     height: i32,
-    p_dimens: Option<(i32, i32)>,
+    length: i32,
+    breadth: i32,
+    /// Clockwise from pointing east, in whole degrees within [0, 360).
+    ruler_angle: i32,
+    /// Ruler center in root window coordinates, kept between rotations so rounding the window
+    /// position does not make the ruler drift. Cleared when the window is moved.
+    ruler_center: Option<(f64, f64)>,
+    diameter: i32,
     freeze: bool,
     frozen_angle: Option<f64>,
-    rotate: Rotation,
     protractor: bool,
     precision: bool,
     edit_angle_offset: bool,
@@ -485,10 +432,13 @@ impl Default for Rlr {
             root_position: (0, 0),
             width: 500,
             height: 35,
-            p_dimens: None,
+            length: 500,
+            breadth: 35,
+            ruler_angle: 0,
+            ruler_center: None,
+            diameter: 500,
             freeze: false,
             frozen_angle: None,
-            rotate: Rotation::E,
             protractor: false,
             precision: true,
             edit_angle_offset: false,
@@ -517,37 +467,145 @@ fn draw_rlr(rlr: Rc<Mutex<Rlr>>, drar: &DrawingArea, cr: &Context) -> glib::Prop
 impl Rlr {
     fn set_size(&self, window: &gtk::ApplicationWindow) {
         if self.protractor {
-            let max = std::cmp::max(self.width, self.height);
-            window.resize(max, max);
+            window.resize(self.diameter, self.diameter);
         } else {
-            window.resize(self.width, self.height);
+            let (w, h) = self.ruler_bounds();
+            window.resize(w, h);
         }
     }
 
-    /// Grows or shrinks the ruler along its length, or the protractor's diameter. The protractor
-    /// keeps its center in place.
+    /// Unit vector along the ruler from its zero end, in window coordinates (y points down).
+    /// Exact at multiples of 90 degrees so the ticks stay on pixel boundaries.
+    fn ruler_direction(&self) -> (f64, f64) {
+        match self.ruler_angle {
+            0 => (1., 0.),
+            90 => (0., 1.),
+            180 => (-1., 0.),
+            270 => (0., -1.),
+            angle => {
+                let radians = f64::from(angle).to_radians();
+                (radians.cos(), radians.sin())
+            }
+        }
+    }
+
+    /// Window size that fits the rotated ruler.
+    fn ruler_bounds(&self) -> (i32, i32) {
+        let (c, s) = self.ruler_direction();
+        let (length, breadth) = (f64::from(self.length), f64::from(self.breadth));
+        let w = length.mul_add(c.abs(), breadth * s.abs());
+        let h = length.mul_add(s.abs(), breadth * c.abs());
+        ((w - 1e-9).ceil() as i32, (h - 1e-9).ceil() as i32)
+    }
+
+    /// Maps ruler coordinates (x along the ruler from its zero end, y across it) to window
+    /// coordinates.
+    fn ruler_matrix(&self) -> gtk::cairo::Matrix {
+        let (c, s) = self.ruler_direction();
+        let (w, h) = self.ruler_bounds();
+        let (half_length, half_breadth) =
+            (f64::from(self.length) / 2., f64::from(self.breadth) / 2.);
+        gtk::cairo::Matrix::new(
+            c,
+            s,
+            -s,
+            c,
+            f64::from(w) / 2. - c * half_length + s * half_breadth,
+            f64::from(h) / 2. - s * half_length - c * half_breadth,
+        )
+    }
+
+    /// Distance from the ruler's zero end to the projection of a window point onto the ruler.
+    fn ruler_offset_of(&self, (x, y): (f64, f64)) -> f64 {
+        let (c, s) = self.ruler_direction();
+        let (w, h) = self.ruler_bounds();
+        (x - f64::from(w) / 2.).mul_add(c, (y - f64::from(h) / 2.) * s)
+            + f64::from(self.length) / 2.
+    }
+
+    fn ruler_center(&self, window: &gtk::ApplicationWindow) -> (f64, f64) {
+        self.ruler_center.unwrap_or_else(|| {
+            let (x, y) = window.position();
+            let (w, h) = self.ruler_bounds();
+            (
+                f64::from(x) + f64::from(w) / 2.,
+                f64::from(y) + f64::from(h) / 2.,
+            )
+        })
+    }
+
+    fn place_ruler(&mut self, center: (f64, f64), window: &gtk::ApplicationWindow) {
+        let (w, h) = self.ruler_bounds();
+        window.resize(w, h);
+        window.move_(
+            (center.0 - f64::from(w) / 2.).round() as i32,
+            (center.1 - f64::from(h) / 2.).round() as i32,
+        );
+        self.ruler_center = Some(center);
+        self.update_input_shape(window);
+    }
+
+    /// Turns the ruler around its center.
+    fn rotate_ruler_to(&mut self, angle: i32, window: &gtk::ApplicationWindow) {
+        let center = self.ruler_center(window);
+        self.ruler_angle = angle.rem_euclid(360);
+        self.interval = Interval::None;
+        self.place_ruler(center, window);
+    }
+
+    /// Grows or shrinks the ruler along its length, or the protractor's diameter. The ruler
+    /// keeps its zero end in place and the protractor its center.
     fn resize_by(&mut self, delta: i32, window: &gtk::ApplicationWindow) {
         if self.protractor {
-            let old = self.width;
-            self.width = std::cmp::max(MIN_SIZE, self.width + delta);
-            self.height = self.width;
-            let shift = (self.width - old) / 2;
+            let old = self.diameter;
+            self.diameter = std::cmp::max(MIN_SIZE, self.diameter + delta);
+            let shift = (self.diameter - old) / 2;
             let (x, y) = window.position();
             window.move_(x - shift, y - shift);
-        } else if self.rotate.is_rotated() {
-            self.height = std::cmp::max(MIN_SIZE, self.height + delta);
+            self.set_size(window);
         } else {
-            self.width = std::cmp::max(MIN_SIZE, self.width + delta);
+            let center = self.ruler_center(window);
+            let (c, s) = self.ruler_direction();
+            let old = f64::from(self.length);
+            self.length = std::cmp::max(MIN_SIZE, self.length + delta);
+            let shift = (f64::from(self.length) - old) / 2.;
+            self.place_ruler((center.0 + c * shift, center.1 + s * shift), window);
         }
-        self.set_size(window);
     }
 
-    /// Restricts the area that catches pointer input: the whole window as a ruler, the disk as a
+    /// Restricts the area that catches pointer input: the ruler itself, the disk as a
     /// protractor, and only the center handle in click-through mode. Clicks anywhere else go to
     /// the window underneath.
     fn update_input_shape(&self, window: &gtk::ApplicationWindow) {
         if !self.protractor {
-            window.input_shape_combine_region(None);
+            if self.ruler_angle % 90 == 0 {
+                window.input_shape_combine_region(None);
+                return;
+            }
+            let matrix = self.ruler_matrix();
+            let (length, breadth) = (f64::from(self.length), f64::from(self.breadth));
+            let corners = [(0., 0.), (length, 0.), (length, breadth), (0., breadth)]
+                .map(|(x, y)| matrix.transform_point(x, y));
+            let (_, h) = self.ruler_bounds();
+            let region = gtk::cairo::Region::create();
+            for y in 0..h {
+                let scan = f64::from(y) + 0.5;
+                let mut span: Option<(f64, f64)> = None;
+                for i in 0..corners.len() {
+                    let (a, b) = (corners[i], corners[(i + 1) % corners.len()]);
+                    if (a.1 - scan) * (b.1 - scan) > 0. || a.1 == b.1 {
+                        continue;
+                    }
+                    let x = a.0 + (scan - a.1) * (b.0 - a.0) / (b.1 - a.1);
+                    span = Some(span.map_or((x, x), |(lo, hi)| (lo.min(x), hi.max(x))));
+                }
+                if let Some((x0, x1)) = span {
+                    let (x0, x1) = (x0.floor() as i32, x1.ceil() as i32);
+                    let _ =
+                        region.union_rectangle(&gtk::cairo::RectangleInt::new(x0, y, x1 - x0, 1));
+                }
+            }
+            window.input_shape_combine_region(Some(&region));
             return;
         }
         let length = f64::from(std::cmp::min(self.width, self.height));
@@ -738,209 +796,122 @@ impl Rlr {
     }
 
     fn draw_rlr(&self, _drar: &DrawingArea, cr: &Context) -> glib::Propagation {
-        let position = self.position;
-        let length: f64 = f64::from(self.width);
-        let height: f64 = f64::from(self.height);
-        let breadth = if self.rotate.is_rotated() {
-            f64::from(self.width)
-        } else {
-            f64::from(self.height)
+        let length = f64::from(self.length);
+        let breadth = f64::from(self.breadth);
+        let base = cr.matrix();
+        let matrix = self.ruler_matrix();
+        let to_window = |x: f64, y: f64| {
+            let (x, y) = matrix.transform_point(x, y);
+            base.transform_point(x, y)
+        };
+        // Text stays upright whatever the ruler's angle, so it is drawn with the window's own
+        // transformation, centered on a point given in ruler coordinates.
+        let show_upright = |label: &str, (x, y): (f64, f64)| {
+            let extents = cr.text_extents(label).expect("Invalid cairo surface state");
+            cr.save().unwrap();
+            cr.set_matrix(base);
+            let (x, y) = to_window(x, y);
+            cr.move_to(
+                x - extents.x_bearing() - extents.width() / 2.,
+                y - extents.y_bearing() - extents.height() / 2.,
+            );
+            cr.show_text(label).expect("Invalid cairo surface state");
+            cr.restore().unwrap();
         };
 
+        cr.select_font_face(
+            self.settings.font_name(),
+            FontSlant::Normal,
+            FontWeight::Normal,
+        );
+        cr.transform(matrix);
+        cr.rectangle(0., 0., length, breadth);
         cr.set_secondary_color(&self.settings);
-        cr.paint().expect("Invalid cairo surface state");
+        cr.fill().expect("Invalid cairo surface state");
 
-        let _pixels_per_tick = 10;
         let tick_size = 5.;
-        let mut i = 0;
-        let mut x: f64;
         cr.set_line_width(0.5);
-        cr.select_font_face(
-            self.settings.font_name(),
-            FontSlant::Normal,
-            FontWeight::Normal,
-        );
+        let interval = match self.interval {
+            Interval::Start(start) => {
+                Some((start, self.ruler_offset_of(self.position), (0.9, 0.9, 0.9)))
+            }
+            Interval::Full(start, end) => Some((start, end, (0.8, 0.8, 0.8))),
+            Interval::None => None,
+        };
+        if let Some((start, end, (r, g, b))) = interval {
+            let (start, end) = (start.clamp(0., length), end.clamp(0., length));
+            cr.rectangle(start - 0.5, 0.5, end - start, breadth - 0.5);
+            cr.set_source_rgb(r, g, b);
+            cr.fill_preserve().expect("Invalid cairo surface state");
+            cr.set_source_rgb(0.1, 0.1, 0.1);
+            cr.stroke().expect("Invalid cairo surface state");
+        }
+
         cr.set_primary_color(&self.settings);
-        cr.save().unwrap();
-        match self.interval {
-            Interval::Start(start_pos) => {
-                cr.set_source_rgb(0.9, 0.9, 0.9);
-                cr.rectangle(
-                    start_pos - 0.5,
-                    0.5,
-                    position.0 - start_pos - 0.5,
-                    breadth - 0.5,
-                );
-                cr.fill().expect("Invalid cairo surface state");
-                cr.set_source_rgb(0.1, 0.1, 0.1);
-                cr.rectangle(
-                    start_pos - 0.5,
-                    0.5,
-                    position.0 - start_pos - 0.5,
-                    breadth - 0.5,
-                );
-                cr.stroke().expect("Invalid cairo surface state");
-            }
-            Interval::Full(start_pos, end_pos) => {
-                cr.set_source_rgb(0.8, 0.8, 0.8);
-                cr.rectangle(
-                    start_pos - 0.5,
-                    0.5,
-                    end_pos - 0.5 - start_pos,
-                    breadth - 0.5,
-                );
-                cr.fill().expect("Invalid cairo surface state");
-                cr.set_source_rgb(0.1, 0.1, 0.1);
-                cr.rectangle(
-                    start_pos - 0.5,
-                    0.5,
-                    end_pos - 0.5 - start_pos,
-                    breadth - 0.5,
-                );
-                cr.stroke().expect("Invalid cairo surface state");
-            }
-            _ => {}
-        }
-        cr.restore().unwrap();
         cr.set_line_width(1.);
-        cr.select_font_face(
-            self.settings.font_name(),
-            FontSlant::Normal,
-            FontWeight::Normal,
-        );
-        let is_reversed = self.rotate.is_reversed();
-        if self.rotate.is_rotated() {
-            while i < self.height {
-                x = f64::from(i).floor() + 0.5;
-                if is_reversed {
-                    x = height - x;
-                }
-                cr.move_to(1.0, x);
-                let tick_size = if i % 50 == 0 {
-                    tick_size * 1.5
-                } else if i % 10 == 0 {
-                    tick_size
-                } else {
-                    tick_size * 0.5
-                };
-                cr.line_to(tick_size, x);
-                cr.stroke().expect("Invalid cairo surface state");
-                cr.move_to(breadth - tick_size, x);
-                cr.line_to(breadth - 1.0, x);
-                cr.stroke().expect("Invalid cairo surface state");
-                if i % 50 == 0 {
-                    // cr.select_font_face("Monospace", FontSlant::Normal, FontWeight::Normal);
-                    let label = format!("{}", i * self.scale_factor);
-                    let extents = cr
-                        .text_extents(&label)
-                        .expect("Invalid cairo surface state");
-                    cr.move_to(breadth / 2. - 2.5 - extents.width() as f64 / 2., x);
-                    cr.show_text(&label).expect("Invalid cairo surface state");
-                }
-                i += 2;
-            }
-            let pos = if self.precision {
-                position.1.floor()
+        let mut i = 0;
+        while i < self.length {
+            let x = f64::from(i) + 0.5;
+            let tick_size = if i % 50 == 0 {
+                tick_size * 1.5
+            } else if i % 10 == 0 {
+                tick_size
             } else {
-                (position.1 / 10.).floor() * 10.
+                tick_size * 0.5
             };
-            let x = pos + 0.5;
-            cr.move_to(1.0, x);
-            cr.line_to(breadth, x);
+            cr.move_to(x, 1.0);
+            cr.line_to(x, tick_size);
             cr.stroke().expect("Invalid cairo surface state");
-            let pos_label = format!("{}px", pos * f64::from(self.scale_factor));
-            let extents = cr
-                .text_extents(&pos_label)
-                .expect("Invalid cairo surface state");
-            cr.rectangle(
-                breadth / 2. - extents.width() as f64 / 2. - 2.,
-                x - extents.height() as f64 - 2.,
-                extents.width() as f64 + 6.5,
-                extents.height() as f64 + 6.5,
-            );
+            cr.move_to(x, breadth - tick_size);
+            cr.line_to(x, breadth - 1.0);
             cr.stroke().expect("Invalid cairo surface state");
-            cr.rectangle(
-                breadth / 2. - extents.width() as f64 / 2.,
-                x - extents.height() as f64,
-                extents.width() as f64 + 4.5,
-                extents.height() as f64 + 4.5,
-            );
-            cr.set_secondary_color(&self.settings);
-            cr.fill().expect("Invalid cairo surface state");
-            cr.set_primary_color(&self.settings);
-
-            cr.move_to(breadth / 2. - extents.width() as f64 / 2., x);
-            cr.show_text(&pos_label)
-                .expect("Invalid cairo surface state");
-
-            cr.rectangle(0.5, 0.5, length - 1.0, height - 1.0);
-        } else {
-            while i < self.width {
-                x = f64::from(i).floor() + 0.5;
-                if is_reversed {
-                    x = length - x;
-                }
-                cr.move_to(x, 1.0);
-                let tick_size = if i % 50 == 0 {
-                    tick_size * 1.5
-                } else if i % 10 == 0 {
-                    tick_size
-                } else {
-                    tick_size * 0.5
-                };
-                cr.line_to(x, tick_size);
-                cr.stroke().expect("Invalid cairo surface state");
-                cr.move_to(x, breadth - tick_size);
-                cr.line_to(x, breadth - 1.0);
-                cr.stroke().expect("Invalid cairo surface state");
-                if i % 50 == 0 {
-                    // cr.select_font_face("Monospace", FontSlant::Normal, FontWeight::Normal);
-                    let label = format!("{}", i * self.scale_factor);
-                    let extents = cr
-                        .text_extents(&label)
-                        .expect("Invalid cairo surface state");
-                    cr.move_to(x - extents.width() as f64 / 2., breadth / 2. + 2.5);
-                    cr.show_text(&label).expect("Invalid cairo surface state");
-                }
-                i += 2;
+            if i % 50 == 0 {
+                show_upright(&format!("{}", i * self.scale_factor), (x, breadth / 2.));
             }
-            let pos = if self.precision {
-                position.0.floor()
-            } else {
-                (position.0 / 10.).floor() * 10.
-            };
-            let x = pos + 0.5 + 2.0;
-            cr.move_to(x - 2., 1.0);
-            cr.line_to(x - 2., breadth);
-            cr.stroke().expect("Invalid cairo surface state");
-
-            let pos_label = format!("{}px", pos * f64::from(self.scale_factor));
-            let extents = cr
-                .text_extents(&pos_label)
-                .expect("Invalid cairo surface state");
-            cr.rectangle(
-                x - 2.,
-                breadth / 2. - extents.height() as f64 - 2.,
-                extents.width() as f64 + 6.5,
-                extents.height() as f64 + 10.5,
-            );
-            cr.stroke().expect("Invalid cairo surface state");
-            cr.rectangle(
-                x,
-                breadth / 2. - extents.height() as f64,
-                extents.width() as f64 + 4.5,
-                extents.height() as f64 + 8.5,
-            );
-            cr.set_secondary_color(&self.settings);
-            cr.fill().expect("Invalid cairo surface state");
-            cr.set_primary_color(&self.settings);
-
-            cr.move_to(x, breadth / 2. + 2.5);
-            cr.show_text(&pos_label)
-                .expect("Invalid cairo surface state");
-
-            cr.rectangle(0.5, 0.5, length - 1.0, breadth - 1.0);
+            i += 2;
         }
+
+        let offset = self.ruler_offset_of(self.position).clamp(0., length - 1.);
+        let pos = if self.precision {
+            offset.floor()
+        } else {
+            (offset / 10.).floor() * 10.
+        };
+        let x = pos + 0.5;
+        cr.move_to(x, 1.0);
+        cr.line_to(x, breadth);
+        cr.stroke().expect("Invalid cairo surface state");
+
+        // The reading sits next to the cursor line, on whichever side has more room.
+        let pos_label = format!("{}px", pos * f64::from(self.scale_factor));
+        let extents = cr
+            .text_extents(&pos_label)
+            .expect("Invalid cairo surface state");
+        let (box_width, box_height) = (extents.width() + 6., extents.height() + 6.);
+        let (c, s) = self.ruler_direction();
+        let reach = (box_width / 2.).mul_add(c.abs(), box_height / 2. * s.abs()) + 3.;
+        let label_x = if x + 2. * reach <= length || x < length / 2. {
+            x + reach
+        } else {
+            x - reach
+        };
+        cr.save().unwrap();
+        cr.set_matrix(base);
+        let (center_x, center_y) = to_window(label_x, breadth / 2.);
+        cr.rectangle(
+            center_x - box_width / 2. - 0.5,
+            center_y - box_height / 2. - 0.5,
+            box_width + 1.,
+            box_height + 1.,
+        );
+        cr.stroke_preserve().expect("Invalid cairo surface state");
+        cr.set_secondary_color(&self.settings);
+        cr.fill().expect("Invalid cairo surface state");
+        cr.restore().unwrap();
+        cr.set_primary_color(&self.settings);
+        show_upright(&pos_label, (label_x, breadth / 2.));
+
+        cr.rectangle(0.5, 0.5, length - 1.0, breadth - 1.0);
         cr.stroke().expect("Invalid cairo surface state");
 
         glib::Propagation::Proceed
@@ -1124,22 +1095,15 @@ where
                         lck.position.1 = f64::from(root_position.1);
                         drop(lck);
                         window.queue_draw();
-                    } else if lck.rotate.is_rotated()
-                        && root_position.1 < lck.height
-                        && root_position.1 > 0
-                    {
-                        lck.root_position = root_position;
-                        lck.position.1 = f64::from(root_position.1);
-                        drop(lck);
-                        window.queue_draw();
-                    } else if !lck.rotate.is_rotated()
-                        && root_position.0 < lck.width
-                        && root_position.0 > 0
-                    {
-                        lck.root_position = root_position;
-                        lck.position.0 = f64::from(root_position.0);
-                        drop(lck);
-                        window.queue_draw();
+                    } else {
+                        let position = (f64::from(root_position.0), f64::from(root_position.1));
+                        let offset = lck.ruler_offset_of(position);
+                        if offset > 0. && offset < f64::from(lck.length) {
+                            lck.root_position = root_position;
+                            lck.position = position;
+                            drop(lck);
+                            window.queue_draw();
+                        }
                     }
                 }
             }
@@ -1185,25 +1149,16 @@ where
             && lck.interval.is_start()
         {
             if let Interval::Start(start_pos) = lck.interval {
-                lck.interval = Interval::Full(
-                    start_pos,
-                    if lck.rotate.is_rotated() {
-                        ev.position().1
-                    } else {
-                        ev.position().0
-                    },
-                );
+                lck.interval = Interval::Full(start_pos, lck.ruler_offset_of(ev.position()));
             }
         } else if matches!(ev.event_type(), gtk::gdk::EventType::DoubleButtonPress) {
-            lck.interval = if lck.rotate.is_rotated() {
-                Interval::Start(ev.position().1)
-            } else {
-                Interval::Start(ev.position().0)
-            };
+            lck.interval = Interval::Start(lck.ruler_offset_of(ev.position()));
         } else if ev.button() == 1 && !lck.precision {
             lck.edit_angle_offset = true;
             drop(lck);
         } else if ev.button() == 1 {
+            lck.ruler_center = None;
+            drop(lck);
             #[allow(clippy::cast_possible_wrap)]
             window.begin_move_drag(1, ev.root().0 as i32, ev.root().1 as i32, ev.time());
         } else if ev.button() == 3
@@ -1276,15 +1231,39 @@ where
         }
     ));
     window.connect_scroll_event(glib::clone!(@strong rlr => move |window, event| {
-        if !event.state().contains(gdk::ModifierType::CONTROL_MASK) {
-            return glib::Propagation::Proceed;
-        }
-        let delta = match event.direction() {
-            gdk::ScrollDirection::Up => SIZE_STEP,
-            gdk::ScrollDirection::Down => -SIZE_STEP,
+        let up = match event.direction() {
+            gdk::ScrollDirection::Up => true,
+            gdk::ScrollDirection::Down => false,
             _ => return glib::Propagation::Proceed,
         };
-        rlr.lock().unwrap().resize_by(delta, window);
+        let mut lck = rlr.lock().unwrap();
+        if event.state().contains(gdk::ModifierType::CONTROL_MASK) {
+            lck.resize_by(if up { SIZE_STEP } else { -SIZE_STEP }, window);
+        } else {
+            // Scrolling up turns counterclockwise, onto the next multiple of the step.
+            let step = if event.state().contains(gdk::ModifierType::SHIFT_MASK) {
+                5.
+            } else {
+                1.
+            };
+            let next = |degrees: f64, counterclockwise: bool| {
+                let steps = degrees / step;
+                let steps = if counterclockwise {
+                    (steps + 1e-6).floor() + 1.
+                } else {
+                    (steps - 1e-6).ceil() - 1.
+                };
+                steps * step
+            };
+            if lck.protractor {
+                let degrees = next(lck.angle_offset.to_degrees(), up);
+                lck.angle_offset = degrees.to_radians().rem_euclid(2. * PI);
+            } else {
+                let degrees = next(f64::from(lck.ruler_angle), !up);
+                lck.rotate_ruler_to(degrees as i32, window);
+            }
+        }
+        drop(lck);
         window.queue_draw();
         glib::Propagation::Stop
     }));
@@ -1329,10 +1308,10 @@ where
         if ppi > 72. {
             lck.ppi = ppi;
             lck.scale_factor = scale_factor;
-            lck.width += (scale_factor * lck.width) / 2;
-            lck.height += (scale_factor * lck.height) / 2;
-            window.set_default_size(lck.width, lck.height);
-            window.resize(lck.width, lck.height);
+            lck.length += (scale_factor * lck.length) / 2;
+            lck.breadth += (scale_factor * lck.breadth) / 2;
+            lck.diameter += (scale_factor * lck.diameter) / 2;
+            lck.set_size(&window);
             window.queue_draw();
             // g_printerr!("resized to {}x{}\n", lck.width, lck.height);
         } else {
@@ -1417,8 +1396,8 @@ fn add_actions(
         {
             let mut lck = rlr.lock().unwrap();
             if !lck.protractor {
-                let _ = lck.rotate.next();
-                let _ = lck.rotate.next();
+                let angle = lck.ruler_angle + 180;
+                lck.rotate_ruler_to(angle, &window);
             }
         }
         window.queue_draw();
@@ -1429,32 +1408,8 @@ fn add_actions(
         {
             let mut lck = rlr.lock().unwrap();
             if !lck.protractor {
-                let tmp = lck.width;
-                lck.width = lck.height;
-                lck.height = tmp;
-                lck.set_size(&window);
-                if let Some(direction) = lck.rotate.next() {
-                    let (mut x, mut y) = window.position();
-                    let (height, width) = (lck.height, lck.width);
-                    drop(lck);
-                    if let Some(dir_x) = direction.0 {
-                        if dir_x {
-                            x += height;
-                        } else {
-                            x = x.saturating_sub(width);
-                            x = std::cmp::max(10, x);
-                        }
-                    }
-                    if let Some(dir_y) = direction.1 {
-                        if dir_y {
-                            y += width;
-                        } else {
-                            y = y.saturating_sub(height);
-                            y = std::cmp::max(10, y);
-                        }
-                    }
-                    window.move_(x, y);
-                }
+                let angle = lck.ruler_angle + 90;
+                lck.rotate_ruler_to(angle, &window);
             }
         }
         window.queue_draw();
@@ -1465,15 +1420,8 @@ fn add_actions(
         {
             let mut lck = rlr.lock().unwrap();
             lck.protractor = !lck.protractor;
-            if let Some((w, h)) = lck.p_dimens.take() {
-                lck.p_dimens = Some((lck.width,lck.height ));
-                lck.width = w;
-                lck.height = h;
-                window.resize(w, h);
-            } else {
-                lck.p_dimens = Some((lck.width,lck.height ));
-                lck.set_size(&window);
-            }
+            lck.ruler_center = None;
+            lck.set_size(&window);
             lck.update_input_shape(&window);
 
         }
@@ -1540,7 +1488,11 @@ fn add_actions(
     }));
     let move_right = gio::SimpleAction::new("move_right", None);
     move_right.connect_activate(glib::clone!(@strong rlr, @weak window => move |_, _| {
-        let precision = rlr.lock().unwrap().precision;
+        let precision = {
+            let mut lck = rlr.lock().unwrap();
+            lck.ruler_center = None;
+            lck.precision
+        };
         let (mut x, y) = window.position();
         if !precision {
             x += 1;
@@ -1553,7 +1505,11 @@ fn add_actions(
 
     let move_left = gio::SimpleAction::new("move_left", None);
     move_left.connect_activate(glib::clone!(@strong rlr, @weak window => move |_, _| {
-        let precision = rlr.lock().unwrap().precision;
+        let precision = {
+            let mut lck = rlr.lock().unwrap();
+            lck.ruler_center = None;
+            lck.precision
+        };
         let (mut x, y) = window.position();
         if !precision {
             x -= 1;
@@ -1566,7 +1522,11 @@ fn add_actions(
 
     let move_up = gio::SimpleAction::new("move_up", None);
     move_up.connect_activate(glib::clone!(@strong rlr, @weak window => move |_, _| {
-        let precision = rlr.lock().unwrap().precision;
+        let precision = {
+            let mut lck = rlr.lock().unwrap();
+            lck.ruler_center = None;
+            lck.precision
+        };
         let (x, mut y) = window.position();
         if !precision {
             y -= 1;
@@ -1579,7 +1539,11 @@ fn add_actions(
 
     let move_down = gio::SimpleAction::new("move_down", None);
     move_down.connect_activate(glib::clone!(@strong rlr, @weak window => move |_, _| {
-        let precision = rlr.lock().unwrap().precision;
+        let precision = {
+            let mut lck = rlr.lock().unwrap();
+            lck.ruler_center = None;
+            lck.precision
+        };
         let (x, mut y) = window.position();
         if !precision {
             y += 1;
@@ -1948,6 +1912,8 @@ Press {ms}?{me} or {ms}F1{me} to {bs}open the About and Help window{be}.
 Press {ms}s{me} or {ms}F2{me} to {bs}open the Settings window{be}.
 Press {ms}r{me} to {bs}rotate{be} 90 degrees. Press {ms}{lt}Shift{gt}r{me} to {bs}flip \
              (mirror){be} the marks without rotation.
+{bs}Scroll{be} to rotate the ruler, or the angle base side in protractor mode, by 1 degree. \
+             Hold down {ms}{lt}Shift{gt}{me} to {bs}rotate by 5 degrees{be}.
 Press {ms}p{me} to toggle {bs}protractor mode{be}.
 Press {ms}t{me} to toggle {bs}click-through{be} in protractor mode: clicks pass through the disk \
              and only the center handle catches them. Double-click the handle to turn it off.

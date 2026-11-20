@@ -61,6 +61,7 @@ If you are on macOS, use <kbd>⌘</kbd> (Command) key instead of <kbd>Ctrl</kbd>
 - Press <kbd>?</kbd> or <kbd>F1</kbd> to **open the About and Help window**.
 - Press <kbd>s</kbd> or <kbd>F2</kbd> to **open the Settings window**.
 - Press <kbd>r</kbd> to **rotate** 90 degrees. Press <kbd>Shift</kbd> + <kbd>r</kbd> to **flip (mirror)** the marks without rotation.
+- **Scroll** to rotate the ruler, or the angle base side in protractor mode, by 1 degree. Hold down <kbd>Shift</kbd> to rotate by 5 degrees.
 - Press <kbd>p</kbd> to toggle **protractor mode**.
 - Press <kbd>f</kbd> or <kbd>Space</kbd> to toggle **freezing the measurements**.
 - Press <kbd>Ctrl</kbd> and drag the angle base side to **rotate it while in protractor mode**.
