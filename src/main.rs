@@ -83,6 +83,8 @@ const APP_ID: &'static str = "com.github.epilys.rlr";
 /// mode.
 const HANDLE_RADIUS: f64 = 14.;
 const DOUBLE_CLICK_MS: u32 = 400;
+const SIZE_STEP: i32 = 10;
+const MIN_SIZE: i32 = 50;
 
 trait CairoContextExt {
     fn set_primary_color(&self, settings: &Settings);
@@ -520,6 +522,19 @@ impl Rlr {
         } else {
             window.resize(self.width, self.height);
         }
+    }
+
+    /// Grows or shrinks the ruler along its length, or the protractor's diameter.
+    fn resize_by(&mut self, delta: i32, window: &gtk::ApplicationWindow) {
+        if self.protractor {
+            self.width = std::cmp::max(MIN_SIZE, self.width + delta);
+            self.height = self.width;
+        } else if self.rotate.is_rotated() {
+            self.height = std::cmp::max(MIN_SIZE, self.height + delta);
+        } else {
+            self.width = std::cmp::max(MIN_SIZE, self.width + delta);
+        }
+        self.set_size(window);
     }
 
     /// Restricts the area that catches pointer input: the whole window as a ruler, the disk as a
@@ -1065,7 +1080,7 @@ where
 {
     let window = gtk::ApplicationWindow::builder()
         .application(application)
-        .events(gdk::EventMask::POINTER_MOTION_MASK)
+        .events(gdk::EventMask::POINTER_MOTION_MASK | gdk::EventMask::SCROLL_MASK)
         .build();
     window.set_icon(Some(
         &gtk::gdk_pixbuf::Pixbuf::from_resource(&format!("/images/{}.svg", APP_ID)).unwrap(),
@@ -1255,6 +1270,19 @@ where
             glib::Propagation::Proceed
         }
     ));
+    window.connect_scroll_event(glib::clone!(@strong rlr => move |window, event| {
+        if !event.state().contains(gdk::ModifierType::CONTROL_MASK) {
+            return glib::Propagation::Proceed;
+        }
+        let delta = match event.direction() {
+            gdk::ScrollDirection::Up => SIZE_STEP,
+            gdk::ScrollDirection::Down => -SIZE_STEP,
+            _ => return glib::Propagation::Proceed,
+        };
+        rlr.lock().unwrap().resize_by(delta, window);
+        window.queue_draw();
+        glib::Propagation::Stop
+    }));
     window.connect_configure_event(
         glib::clone!(@strong rlr => move |window: &gtk::ApplicationWindow, event: &gdk::EventConfigure| {
             {
@@ -1477,41 +1505,12 @@ fn add_actions(
 
     let increase = gio::SimpleAction::new("increase", None);
     increase.connect_activate(glib::clone!(@strong rlr, @weak window => move |_, _| {
-        {
-            let mut lck = rlr.lock().unwrap();
-            if !lck.protractor {
-                if lck.rotate.is_rotated() {
-                    lck.height += 50;
-                } else {
-                    lck.width += 50;
-                }
-            } else {
-                lck.width += 50;
-                lck.height = lck.width;
-            }
-            lck.set_size(&window);
-        }
+        rlr.lock().unwrap().resize_by(SIZE_STEP, &window);
         window.queue_draw();
     }));
     let decrease = gio::SimpleAction::new("decrease", None);
     decrease.connect_activate(glib::clone!(@strong rlr, @weak window => move |_, _| {
-        {
-            let mut lck = rlr.lock().unwrap();
-            if !lck.protractor {
-                if lck.rotate.is_rotated() {
-                    lck.height -= 50;
-                    lck.height = std::cmp::max(50, lck.height);
-                } else {
-                    lck.width -= 50;
-                    lck.width = std::cmp::max(50, lck.width);
-                }
-            } else {
-                lck.width -= 50;
-                lck.width = std::cmp::max(50, lck.width);
-                lck.height = lck.width;
-            }
-            lck.set_size(&window);
-        }
+        rlr.lock().unwrap().resize_by(-SIZE_STEP, &window);
         window.queue_draw();
     }));
     let increase_font_size = gio::SimpleAction::new("increase_font_size", None);
@@ -1951,7 +1950,8 @@ Press {ms}f{me} or {ms}{lt}Space{gt}{me} to toggle {bs}freezing the measurements
 Press {ms}{primary}{me} and drag the angle base side to {bs}rotate it while in protractor mode{be}.
 Press {ms}{primary}{me} continuously to {bs}disable precision{be} (measurements will snap to \
              nearest integer).
-Press {ms}+{me} to {bs}increase size{be}. Press {ms}-{me} to {bs}decrease size{be}.
+Press {ms}+{me} to {bs}increase size{be}. Press {ms}-{me} to {bs}decrease size{be}. Or hold \
+             down {ms}{primary}{me} and {bs}scroll{be}.
 Press {ms}{lt}{primary}{gt}+{me}, {ms}{lt}{primary}{gt}+{me} to {bs}increase font size{be}. Press \
              {ms}{lt}{primary}{gt}-{me}, {ms}{lt}{primary}{gt}{me} to {bs}decrease font size{be}.
 Press {ms}Up{me}, {ms}Down{me}, {ms}Left{me}, {ms}Right{me} to {bs}move window position by 10 \
